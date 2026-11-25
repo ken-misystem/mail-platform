@@ -1,0 +1,11 @@
+[Unit]
+Description=Mail client certificate public entrances
+ConditionPathExists=/etc/mail-client-certificates-v1/activation-approved.json
+[Socket]
+Accept=no
+Service=mail-client-cert-gate.service
+BindIPv6Only=ipv6-only
+Backlog=128
+ListenStream=192.0.2.254:993
+ListenStream=192.0.2.254:995
+ListenStream=192.0.2.254:587

@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for a completed OS update or MariaDB restart
+PartOf=mail-platform-update.timer
+
+[Timer]
+OnActiveSec=5s
+OnUnitInactiveSec=30s
+AccuracySec=2s
+Unit=mail-platform-os-reconcile.service
+
+[Install]
+WantedBy=mail-platform-update.timer

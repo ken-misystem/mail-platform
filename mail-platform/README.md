@@ -1,0 +1,82 @@
+# Mail platform — 同一リポジトリで管理する配布候補
+
+標準Roundcube＋独自プラグインを使う配布候補である。導入・更新・復旧の合否は、実際に検証した候補hashと検証結果へ結び付ける。正式署名とGitHub公開は本人確認後に行う。検証範囲と導入先の確認項目はVALIDATION.mdを参照する。
+
+## ソースと更新の関係
+
+製品の公開・更新先は ken-misystem/mail-platform とする。公開名義はMI SYSTEMである。build.pyはsource-catalog.jsonに登録した開発元の現行ソースを毎回直接読む。開発元を修正し、build・検証・署名した資材を事業用リポジトリへ公開する。履歴・診断・試験専用ファイルは公開資材から除外する。
+
+- provider=repository：同一repo内の登録ファイルを読む。payload内のスナップショットより常に優先する。
+- provider=generated：同一repoの既存生成処理から作る。旧成功試験は実行しない。入力と証拠の整合が崩れた場合、古いコードを黙って配布せずbuildを停止する。
+- provider=package：このディレクトリの新規実装・blueprint等が参照元。framework/とui/を編集する。payloadは配布候補とoffline依存cache。
+- vendor.tmpがない環境では、保存済み依存cacheをcomposer.lockの完全一致時だけ利用する。lock更新時は依存を再構築して候補を更新する。
+
+開発元へのcommit後、事業用リポジトリに検証済みの署名付き正式Releaseを公開すると更新機構が検出する。管理画面で「正式リリースを自動更新」「通知を確認して手動で更新」を切替える。
+
+## 候補の生成
+
+通常のbuild.pyまたはrelease_assets.py prepareは、標準Roundcubeと転送・フィルター・休暇応答の独自プラグインを使う候補を生成する。既定値はpluginで、`--roundcube-settings plugin` でも明示できる。既知のmanagesieve修正2件は原版へ戻す。旧構成を検証する場合は `--roundcube-settings legacy` を明示する。既存環境の設定移行は専用工程で確認する。[プラグインの設定と制約](plugins/mail_settings/README.md)
+
+```powershell
+python -B mail-platform/build.py --repository-root . --version 0.1.0 --output ./mail-platform-dist/0.1.0-candidate
+```
+
+現在の成果物は source-candidate.tar.gz とbuild-result.json。秘密鍵、パスワード、Webhook、実DB行、メール、UIDL、取得履歴は含めない。既存の独自コード・管理画面・独自Roundcube拡張・DB構造・最小権限metadata・systemdのblueprintを含む。
+
+```sh
+# 候補の読取り確認だけ。既存の/etcやサービスへ適用しない。
+python3 install.py plan --site site.example.json
+python3 install.py stage --site site.example.json --output ./bound-candidate
+```
+
+site.example.jsonは合成値。サーバー名・ドメイン・IP・通知先を検証して置き換え、内部コードpinも再計算する。現行ken専用POP/旧XMail残着回収は移行専用であり、新規導入時に有効化しない。
+
+## 更新候補の動作
+
+GitHub Releases APIで正式版だけを検出。Ed25519署名、archive/manifest/payloadのSHA256、パス・型・展開量を確認。バージョンの巻戻し、任意URL、リンク付きarchive、未署名/不完全Releaseを拒否する。信頼する公開鍵は初期導入時に別経路で固定し、同じReleaseから自動採用しない。
+
+自動/手動の設定は版付きCASで保存。管理画面はsystemAdmin＋既存パスキー確認＋CSRF＋期限付きnonce＋rate limitを使用。非root PHPからの命令は固定Unix操作だけで、shell/URL/パスを受け付けない。root brokerは固定peer UIDだけを許可する。
+
+更新はplan→stage→activate→health。状態と取引履歴をfsync保存し、health失敗はrollback。復旧不能/終了不明は保留して再試行しない。同じ失敗版を自動再実行しない。手動待機中は検証済みcacheを再利用し、15分ごとの再downloadを避ける。実データ領域はreleaseと分離し、DBの破壊的migrationを自動復旧で巻き戻さない。
+
+正式配布時の固定asset名は mail-platform.tar.gz / release.json / release.sig。未署名の導入候補はinstall_ready=falseで生成する。通常更新と、管理画面・Roundcube・送信量policyを対象とするformat 2の導入・更新・条件付き復旧を隔離環境で確認した。検証条件と登録構成が一致する正式資材は--install-readyで準備できる。本番署名用の暗号化Ed25519鍵は生成・公開署名証跡の独立検証まで完了した。信頼する公開鍵は導入時の別経路で照合する。
+
+## 確認結果と導入先の準備
+
+新規導入の初期UIはloopback HTTPSに限定する。初期パスワードは管理端末へ期限付きで発行し、パスキー確認と恒久パスワードへの更新後、rootが明示的に公開する。手順はINITIAL_SETUP.mdを参照する。追加した初期設定方式の検証状態はreadiness.jsonのsecure_initial_setup_validatedへ記録する。
+
+readiness.jsonとINSTALLATION.mdを参照。基本設定・証明書actor5設定・同一repo由来の依存組立て、OS package・専用OS利用者・DB・配置・サービスの新規導入adapterを実装した。installの入口は明示的な--apply、私有kit、取引ごとの新規証拠領域、端末での管理者パスワード入力を要求する。設定復旧はCASで行い、DB・メール・履歴・秘密を保持する。
+
+空Debian13での実導入・認証付き画面・実サービスでの更新/復旧を、候補ごとの保存結果で確認する。旧構成の成功証拠と最新構成の差分を照合する。正式資材への採用には対象候補全体の検証結果を使用する。現候補はinstall_ready=falseで生成する。
+
+独自コードのライセンスはMIT、著作権表示はMI-SYSTEMである。LICENSEとLICENSING.mdに全文と第三者製コードの配布条件を収録した。
+
+## 2026-11-12の追加実装
+
+本番で確認済みのログ日時解析・POP worker取得予算・公開索引修正、Roundcubeのタブ版アプリ設定ヘルプとFairEmailのPOP案内訂正を収録した。source-patches.jsonは現在の登録元ソースへ差分を適用する。既に反映済みなら再適用せず、前提が一致しなければbuildを停止する。
+
+更新用payload/installer.pyはplan・stage・activate・health・rollbackを実装する。初回導入時に所有ファイルとunitのhash/属性を記録し、更新時に照合する。取引ごとに操作と原出力を保存し、未知差分・実行結果不明は保留する。親処理の版記録失敗時にはコードと版記録の両方を条件付きで復旧する。
+
+更新候補には版ごとのupdate-contract.jsonを含める。build.pyの--update-contractで指定し、停止・再開・reload・健康確認の対象を明示する。現在のhookは既存schema・設定blueprint・証明書runtimeを維持するコード更新を扱う。DB/設定変更、unit追加/削除、証明書runtime変更には専用migration hookと検証が必要である。
+
+以前のローカル/非root検証証拠を再利用し、空Debian13での通常導入、管理画面、実root更新hookの適用・条件付き復旧・未知差分保留を確認した。結果と各記録のhashは配布準備側のwsl-validation-v1/REPORT.mdおよびFINAL_ASSESSMENT.jsonに保存した。
+
+現行Dovecotはcnfix1独自修正版。標準Debian版への置換は互換扱いしない。対応source/patchからの実build・実導入・依存版/noticeを確認した。bit単位の再現buildは未確認である。Roundcube1.6.20の転送エラー修正patchも保持する。core更新時は適用元の版・hashを再照合する。
+
+WSL内の空Debian13で実導入と更新/復旧、実ブラウザーで管理者ログインと更新方式変更を確認した。更新配信元は専用HTTPS fixture、署名は検証鍵、パスキーは仮想認証器を使用した。実メール送信は0件である。実VPS・実GitHub・物理認証器の確認は導入先で実施する。
+
+## 配布資材の操作入口
+
+release_assets.pyのplan・prepare・sign・verifyで、固定assetの生成・暗号化鍵による署名・公開鍵での独立確認を行う。操作はRELEASE.mdを参照する。候補を合成鍵で署名してもinstall_ready=falseを保持する。必須検証欄の欠落時も正式資材の生成・署名を保留する。
+
+公開コードのライセンス一覧はTHIRD_PARTY.mdを参照する。build.pyとrelease_assets.pyは、導入・更新資材へdistribution-inventory.jsonを収録する。同梱Composer依存の宣言ライセンス・版・noticeのhash、PyMySQL wheelの許諾文、各componentの取得方法を記録する。
+
+標準の取得方法はdistribution-policy.jsonとDISTRIBUTION.mdを参照する。native_assets.pyとnative-assets-lock.jsonでClamAV公式資材を照合し、現地kitへ準備する。改造版binaryを別配布するときは対応source・notice・build recipeを同版で提供する。NATIVE_ASSETS.mdに準備手順を記載する。
+
+## 運用境界
+
+本番への導入、既存サービスの停止/reload/restart、新しい秘密の配置、正式Release公開、GitHub pushは別途対象と内容を確定して承認を受ける。Private repoのActionsは変更・実行しない。正式リリースはローカル/承認済み検証サーバーで検証して作成する。
+
+APIの参照：GitHub公式 https://docs.github.com/en/rest/releases/releases 。第三者依存のLICENSEはpayload内に保持。
+
+既存の0.4.18・0.4.17では更新元の切替えが必要です。[配布先変更と手動更新の手順](https://github.com/ken-misystem/mail-platform/blob/main/MANUAL-UPDATE.md)

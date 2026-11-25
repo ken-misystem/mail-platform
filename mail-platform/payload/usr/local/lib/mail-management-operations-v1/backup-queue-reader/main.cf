@@ -1,0 +1,10 @@
+# Read-only postqueue client in the collector's network namespace.
+inet_interfaces = loopback-only
+inet_protocols = ipv4
+queue_directory = /var/lib/mail-backup-mx-v1/primary/queue
+meta_directory = /etc/postfix
+daemon_directory = /usr/lib/postfix/sbin
+command_directory = /usr/sbin
+mail_owner = postfix
+setgid_group = postdrop
+authorized_mailq_users = root

@@ -1,0 +1,30 @@
+{
+  "confirm_observations": 2,
+  "deferred_warning_count": 10,
+  "disk_critical_bytes": 268435456,
+  "disk_critical_percent": 5,
+  "disk_warning_bytes": 1073741824,
+  "disk_warning_percent": 10,
+  "enabled": false,
+  "inode_critical_available": 1000,
+  "inode_warning_available": 10000,
+  "max_attempts": 5,
+  "max_outbox_entries": 128,
+  "max_submissions_per_hour": 6,
+  "queue_critical_age_seconds": 3600,
+  "queue_warning_age_seconds": 900,
+  "recipient": "alerts@notify.invalid",
+  "recovery_observations": 2,
+  "retry_seconds": [
+    300,
+    900,
+    1800,
+    3600,
+    7200
+  ],
+  "sender": null,
+  "snapshot_max_age_seconds": 180,
+  "submission_min_interval_seconds": 300,
+  "transport": null,
+  "version": 1
+}

@@ -1,0 +1,26 @@
+[Unit]
+Description=Reconcile installed mail runtime after OS package and database changes
+After=mariadb.service
+PartOf=mail-platform-os-reconcile.timer
+ConditionPathExists=/etc/mail-client-certificates-v1/activation-approved.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/lib/mail-platform-update/entry.py os-reconcile
+UMask=0077
+StateDirectory=mail-platform-os-reconcile
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/etc/mail-client-certificates-v1 /usr/local/lib/mail-client-certificates-v1 /var/lib/mail-platform-update /run/lock /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitCORE=0
+MemoryMax=384M
+MemorySwapMax=0
+TimeoutStartSec=12min
