@@ -9,6 +9,7 @@ from host_transaction import regular, durable_json
 from release import canonical, sha
 from update_sources import select as select_source
 from availability_plan import select as select_components
+import certificate_manifest_update as certificate_update
 
 DESCRIPTOR = 'blueprint/migrations/adaptive-update-v1.json'
 CONTRACT = {'format': 1, 'ordinary': 'code', 'enrolled': 'generation-with-maintenance',
@@ -27,6 +28,8 @@ def engine_for(payload, root='/'):
 
 
 class HybridGenerationUpdate(GenerationUpdate):
+    certificate_transaction = True
+
     def managed_unit_changes(self, receipt, bound):
         from os_update_units import changes
         contract = json.loads((self.payload/'blueprint/update-contract.json').read_bytes())
@@ -55,10 +58,18 @@ class HybridGenerationUpdate(GenerationUpdate):
     def select_changes(self, contract, config, changes):
         return select_components(contract,config,changes,shared_closure=True,allow_empty=True)
 
-    def partition_changes(self, changes, config):
+    def partition_changes(self, changes, config, bound, receipt):
         roots = [r for c in config['components'].values() for r in c['roots']]
         self.pending_static = {p:c for p,c in changes.items() if not any(p.startswith(r+'/') for r in roots)}
-        return {p:c for p,c in changes.items() if p not in self.pending_static}
+        owned = {p:c for p,c in changes.items() if p not in self.pending_static}
+        self.certificate_transition, actors = certificate_update.plan_files(self, bound, receipt)
+        if self.certificate_transition:
+            if any(path.startswith(certificate_update.RUNTIME) for path in owned):
+                raise ValueError('certificate_update_requires_static_runtime')
+            for target, item in actors.items():
+                self.pending_static[target] = {'before':item['before'], 'attributes':item['after'],
+                                              'source':item['source'], 'sha256':item['after']['sha256']}
+        return owned
 
     def plan(self):
         result = super().plan()
@@ -73,6 +84,8 @@ class HybridGenerationUpdate(GenerationUpdate):
         # stopped, restarted or required active by this generation update.
         for action in ('stop','start','reload','health'):
             maintenance[action] = [n for n in maintenance[action] if n != 'php8.4-fpm.service']
+        if self.certificate_transition:
+            maintenance = certificate_update.extend_contract(self, maintenance, self.record['old_receipt']['unit_files'])
         names = set().union(*(set(maintenance[k]) for k in ('pause','stop','start','reload','health')))
         states = {n:self.unit(n) for n in sorted(names)}
         registration = None
@@ -91,13 +104,15 @@ class HybridGenerationUpdate(GenerationUpdate):
                       'attributes':row['after']} for p,row in self.record['managed_unit_changes'].items()}
         self.record.update(static_changes={**self.pending_static,**managed},maintenance=maintenance,
             before_units=states,last_units=dict(states),operation_started=None,
-            maintenance_started=False,maintenance_resumed=False,registration=registration)
+            maintenance_started=False,maintenance_resumed=False,registration=registration,
+            certificate_manifest_update=self.certificate_transition)
         self.save()
         return dict(result,static_files=len(self.record['static_changes']))
 
     def stage(self):
         result = super().stage()
         bound = self.render(self.record['old_receipt'])
+        self.bind_staged_certificate(bound)
         for p,c in self.record['static_changes'].items():
             raw = bound[c['source']]
             if sha(raw) != c['sha256']:
@@ -122,6 +137,7 @@ class HybridGenerationUpdate(GenerationUpdate):
             elif self.quiet_state(n,current):
                 self.record['last_units'][n]=current;self.save()
             else:raise ValueError('hybrid_actor_not_quiet:'+n)
+            certificate_update.wait_for_health(self, n)
 
     def resume(self):
         value=self.record['maintenance']
@@ -133,6 +149,7 @@ class HybridGenerationUpdate(GenerationUpdate):
         self.load()
         if self.record['phase']!='staged' or not self.record.get('static_staged'):
             raise ValueError('hybrid_activation_order')
+        certificate_update.before_activation(self)
         self.quiet()
         for p,c in self.record['static_changes'].items():
             actual=self.live(p)[1] if os.path.lexists(self.files.target(p)) else None
@@ -140,6 +157,7 @@ class HybridGenerationUpdate(GenerationUpdate):
             raw=regular(self.directory/'static-stage'/p.lstrip('/'))[0]
             if sha(raw)!=c['sha256']:raise ValueError('hybrid_static_staging_drift')
             m=c['attributes'];self.files.write(p,raw,m['mode'],m['uid'],m['gid'],expected_before=c['before'])
+        certificate_update.verify_pins(self, 'after')
         if self.record.get('managed_unit_changes'):
             self.commands.run('os_unit_reload',['/usr/bin/systemctl','daemon-reload'])
         registered=self.record['registration']
@@ -161,12 +179,13 @@ class HybridGenerationUpdate(GenerationUpdate):
             if current!=expected:raise ValueError('hybrid_static_health_drift')
             if p in self.record.get('managed_unit_changes',{}):
                 receipt['unit_files'] = {**receipt['unit_files'],Path(p).name:current}
-            else:
+            elif p not in certificate_update.CONFIGS:
                 receipt['code'][p]=current
         return receipt
 
     def health(self):
         self.load()
+        certificate_update.verify_pins(self, 'after')
         for n in self.record['maintenance']['health']:
             if self.record['before_units'][n]['ActiveState']=='active':
                 self.commands.run('static_health',['/usr/bin/systemctl','is-active','--quiet',n])
@@ -180,6 +199,9 @@ class HybridGenerationUpdate(GenerationUpdate):
         if self.record.get('operation_started'):raise ValueError('hybrid_service_outcome_unknown')
         for e in self.files.entries:
             if self.files.mark_unapplied(e) or e['phase']=='restored':continue
+            change = self.record.get('static_changes', {}).get(e['path'])
+            if change:
+                certificate_update.recover_write(self, e, {'before':change['before'], 'after':change['attributes']})
             if e['phase']!='written' or self.live(e['path'])[1]!=e['after']:
                 raise ValueError('hybrid_rollback_unknown_file')
         if self.record.get('maintenance_started'):
@@ -188,6 +210,7 @@ class HybridGenerationUpdate(GenerationUpdate):
             self.quiet()
         result=super().rollback()
         if self.record.get('maintenance_started'):
+            certificate_update.verify_pins(self, 'before')
             if self.record.get('managed_unit_changes'):
                 self.commands.run('os_unit_restore_reload',['/usr/bin/systemctl','daemon-reload'])
             self.resume()

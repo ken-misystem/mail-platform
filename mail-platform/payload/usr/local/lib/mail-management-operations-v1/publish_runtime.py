@@ -15,6 +15,8 @@ SOURCE_SHA = 'fa793434ffe8f5d947e6b2f21af25f0f6706a58ed96cc12802e1b3080c06bb9e'
 GROUP = 113  # Existing verified mailadmin group; no identity/grant creation.
 UPDATE_UNIT = 'mail-platform-update.service'
 UPDATE_MARKER = 'MAIL_PLATFORM_PERIODIC_LOOKUP_FAILED=1'
+MARKERS = {UPDATE_MARKER:'lookup', 'MAIL_PLATFORM_PRE_APPLY_BUSY=unknown':'busy',
+           'MAIL_PLATFORM_PRE_APPLY_BUSY=os_reconcile':'busy_os'}
 
 
 def need(ok):
@@ -57,14 +59,15 @@ def periodic_update_failure(snapshot, capture):
                 re.fullmatch('[0-9a-f]{32}', invocation) and int(invocation, 16)):
             return None
         query = ('/usr/bin/journalctl', '--boot', '--no-pager', '--output=json', '--lines=2',
-                 '--output-fields=MESSAGE,_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID,_UID', '--grep=^'+UPDATE_MARKER+'$',
+                 '--output-fields=MESSAGE,_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID,_UID', '--grep=^('+'|'.join(MARKERS)+')$',
                  '_SYSTEMD_UNIT='+UPDATE_UNIT, '_SYSTEMD_INVOCATION_ID='+invocation, '_UID=0')
         raw, meta = capture(query, 4096, timeout=3)
         if meta['reason'] is not None or len(raw.splitlines()) != 1:
             return None
         row = json.loads(raw)
-        if (row.get('MESSAGE'), row.get('_SYSTEMD_UNIT'), row.get('_SYSTEMD_INVOCATION_ID'), row.get('_UID')) != (
-                UPDATE_MARKER, UPDATE_UNIT, invocation, '0'):
+        reason = MARKERS.get(row.get('MESSAGE'))
+        if not reason or (row.get('_SYSTEMD_UNIT'), row.get('_SYSTEMD_INVOCATION_ID'), row.get('_UID')) != (
+                UPDATE_UNIT, invocation, '0'):
             return None
         stamp = row.get('__REALTIME_TIMESTAMP')
         if not isinstance(stamp, str) or not re.fullmatch('[0-9]{1,19}', stamp):
@@ -74,7 +77,19 @@ def periodic_update_failure(snapshot, capture):
             return None
         after, meta = capture(command, 4096, timeout=3)
         if meta['reason'] is None and before == after:
-            return {'invocation': invocation, 'run_epoch': run_epoch}
+            result = {'invocation': invocation, 'run_epoch': run_epoch, 'reason': reason}
+            # The next activation already includes the timer's random delay.
+            try:
+                timers, meta = capture(('/usr/bin/systemctl','list-timers','--all','--no-pager',
+                                        '--output=json','mail-platform-update.timer'), 4096, timeout=3)
+                timer, = json.loads(timers)
+                due = timer.get('next')
+                if (meta['reason'] is None and timer.get('unit') == 'mail-platform-update.timer'
+                        and type(due) is int and run_epoch < due//1000000 <= run_epoch+86400):
+                    result['next_epoch'] = due//1000000
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+            return result
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None  # Absence of proof retains the existing severity.
     return None

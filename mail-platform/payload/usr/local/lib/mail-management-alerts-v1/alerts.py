@@ -25,7 +25,9 @@ UPDATE_UNIT = 'mail-platform-update.service'
 
 
 def periodic_update_run(proof, units, observed, snapshot):
-    if not isinstance(proof, dict) or set(proof) != {'invocation', 'run_epoch', 'snapshot_sha256'}:
+    if (not isinstance(proof, dict) or not {'invocation','run_epoch','snapshot_sha256'} <= set(proof)
+            or set(proof)-{'invocation','run_epoch','snapshot_sha256','reason','next_epoch'}
+            or proof.get('reason','lookup') not in ('lookup','busy','busy_os')):
         return None
     invocation, run = proof['invocation'], proof['run_epoch']
     if not isinstance(invocation, str) or not re.fullmatch('[0-9a-f]{32}', invocation) or not int(invocation, 16):
@@ -115,6 +117,7 @@ def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None):
         need(type(checks) is dict and set(checks) == set(CHECKS), 'check_set')
         result = {'snapshot': {}, 'backup_queue': None, **{name: None for name in CHECKS}}
         update_run = None
+        unit_details = {}
         for name in CHECKS:
             c = checks[name]
             need(type(c) is dict and c['status'] in ('ok', 'fail'), 'check_status')
@@ -142,6 +145,7 @@ def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None):
                     inactive = v['active'] != 'active' and (unit.endswith(('.timer', '.socket')) or (unit not in oneshots and extra is None))
                     if failed or inactive:
                         findings[unit] = 'warning' if unit == UPDATE_UNIT and update_run is not None else 'critical'
+                        unit_details[unit] = {k:v[k] for k in ('load','active','result','main_exit')}
             elif name in ('system_storage', 'mail_storage'):
                 total = number(data['total_bytes'], 1)
                 free = number(data['available_bytes'], 0, total)
@@ -202,9 +206,14 @@ def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None):
                 if expiry <= now:
                     findings['expired'] = 'critical'
             result[name] = findings
-        observation = {'token': observed, 'domains': result}
+        observation = {'token': observed, 'domains': result, 'unit_details':unit_details}
         if update_run is not None:
             observation['periodic_update_run'] = update_run
+            detail = {'reason':periodic_failure.get('reason','lookup'), 'run':update_run}
+            due = periodic_failure.get('next_epoch')
+            if type(due) is int and update_run < due <= update_run+86400:
+                detail['next'] = due
+            observation['update_detail'] = detail
         return observation
     except (ValueError, TypeError, KeyError, OverflowError, UnicodeError):
         return {'token': now, 'domains': {'snapshot': {'invalid': 'critical'}}}

@@ -13280,8 +13280,8 @@
     "sha256": "fe3a29aaecc6f5e4c82f2765332276bb5ad3ecb62588e9262dfdbc47a204fc12"
   },
   "src/UpdateController.php": {
-    "bytes": 7594,
-    "sha256": "5d6d36987c4afff97f1d2d0c40296a2d1cb05e6e34326bfc4eceb41ec64a9e32"
+    "bytes": 8169,
+    "sha256": "0448edefa1e5674ba981236692296c0e06fc26d89fa95c3c2d4b5d55dc472616"
   },
   "src/UserPolicyLimits.php": {
     "bytes": 1353,

@@ -188,7 +188,8 @@ def main():
         phase = 'locked_cycle'
         with storage.Store(PRIVATE, lambda v: engine.validate(v, policy)) as journal:
             state, outcomes, faults = engine.cycle(journal, observation, policy, config['channels'], adapters,
-                                                  lambda: int(time.time()), storage.Archive(PRIVATE+'/archive'))
+                                                  lambda: int(time.time()), storage.Archive(PRIVATE+'/archive'),
+                                                  storage.UpdateNotes(journal))
             status = engine.summary(state, int(time.time()), config['channels'], outcomes)
             status['worker'] = {'status': 'warning' if faults else 'ok', 'faults': faults}
             phase = 'public_status'

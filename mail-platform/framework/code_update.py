@@ -14,6 +14,7 @@ from roundcube_core import TARGETS as ROUNDCUBE_TARGETS,render as render_roundcu
 from roundcube_update import AuthLinks, locale_before
 from sieve_lock import MODULE as SIEVE_MODULE
 from code_attributes import attributes as code_attributes
+import certificate_manifest_update as certificate_update
 
 CERTIFICATE = 'usr/local/lib/mail-client-certificates-v1/'
 PREFIXES = ('usr/local/lib/', 'usr/local/sbin/', 'opt/mail-management/',
@@ -58,7 +59,7 @@ def contract(value, receipt, units):
     return value
 
 
-def render(payload, receipt, read_live, *, certificate_adoption=False):
+def render(payload, receipt, read_live, *, certificate_adoption=False, certificate_transaction=False):
     from monitor_binding import update as monitoring_update
     monitoring_update(read_live)
     files = read_payload(payload)
@@ -93,43 +94,9 @@ def render(payload, receipt, read_live, *, certificate_adoption=False):
     output = rebase(bound, baseline)
     if SIEVE_MODULE in receipt['code']:
         output[SIEVE_MODULE.lstrip('/')] = read_live(SIEVE_MODULE)[0]
-    if sha(output[manifest_name]) != sha(read_live('/'+manifest_name)[0]) and not certificate_adoption:
-        # The removed advisory CA custody path was inert. Check that only this
-        # redaction changed, including the old registered bytes and new pin.
-        import ast
-        plan_name = 'client-certificates/activation-stack-v1/policy.py'
-        target = CERTIFICATE + plan_name
-        live = read_live('/'+target)[0]
-        original = sha(live)
-        expected = dict(current, pins=dict(current['pins']))
-        expected['pins'][plan_name] = sha(output[target])
-        if (receipt['code'].get('/'+target, {}).get('sha256') != original
-                or current['pins'].get(plan_name) != original
-                or json.loads(output[manifest_name]) != expected):
-            raise ValueError('certificate_runtime_requires_dedicated_release_hook')
-        old = ast.parse(live)
-        new = ast.parse(output[target])
-        # Compare syntax trees after removing exactly the old declaration,
-        # import, advisory path assertion and its value in the returned plan.
-        imports = [n for n in old.body if isinstance(n, ast.ImportFrom) and n.module == 'pathlib'
-                   and [(a.name,a.asname) for a in n.names] == [('PureWindowsPath',None)]]
-        paths = [n for n in old.body if isinstance(n, ast.Assign) and len(n.targets)==1
-                 and isinstance(n.targets[0], ast.Name) and n.targets[0].id=='CA_BACKUP'
-                 and isinstance(n.value, ast.Constant) and isinstance(n.value.value,str)]
-        if len(imports)!=1 or len(paths)!=1:
-            raise ValueError('certificate_advisory_declarations_changed')
-        old.body.remove(imports[0])
-        old.body.remove(paths[0])
-        [function] = [n for n in old.body if isinstance(n,ast.FunctionDef) and n.name=='selected_plan']
-        guard = ast.parse("need(PureWindowsPath(CA_BACKUP).is_absolute() and 'mail-server-admin' not in CA_BACKUP.lower(), 'ca_backup_outside_repository')").body[0]
-        [check] = [n for n in function.body if ast.dump(n)==ast.dump(guard)]
-        function.body.remove(check)
-        [field] = [(d,i) for d in ast.walk(function) if isinstance(d,ast.Dict)
-                   for i,k in enumerate(d.keys) if isinstance(k,ast.Constant) and k.value=='ca_backup_proposed_path'
-                   and isinstance(d.values[i],ast.Name) and d.values[i].id=='CA_BACKUP']
-        field[0].values[field[1]]=ast.Constant(value=None)
-        if ast.dump(old)!=ast.dump(new):
-            raise ValueError('certificate_advisory_transition_not_exact')
+    if (sha(output[manifest_name]) != sha(read_live('/'+manifest_name)[0])
+            and not (certificate_adoption or certificate_transaction)):
+        raise ValueError('certificate_runtime_requires_dedicated_release_hook')
     for name in ('runtime.py','binding.py','collector_core.py','split_core.py','split_runtime.py','cold_exec.py','scale_core.py'):
         path='usr/local/lib/mail-quota-v1/'+name
         if path in output and sha(output[path])!=receipt['code'].get('/'+path,{}).get('sha256'):
@@ -156,6 +123,8 @@ def render(payload, receipt, read_live, *, certificate_adoption=False):
 
 
 class CodeUpdate:
+    certificate_transaction = True
+
     def __init__(self, payload, transaction, root='/', commands=None):
         self.payload = Path(payload)
         self.directory = Path(transaction)
@@ -170,7 +139,14 @@ class CodeUpdate:
         return regular(self.files.target(name))
 
     def render(self, receipt):
-        return render(self.payload, receipt, self.live)
+        return render(self.payload, receipt, self.live, certificate_transaction=self.certificate_transaction)
+
+    def bind_staged_certificate(self, bound):
+        expected = self.record.get('certificate_manifest_update')
+        if expected:
+            actual, _ = certificate_update.plan_files(self, bound, self.record['old_receipt'])
+            if actual != expected:
+                raise ValueError('certificate_update_stage_drift')
 
     def save(self):
         durable_json(self.record_path, self.record)
@@ -196,7 +172,7 @@ class CodeUpdate:
         raw = self.commands.run('inspect_'+name.replace('-', '_').replace('.', '_').replace('@', '_'),
             ['/usr/bin/systemctl', 'show', name, '-p', 'ActiveState,SubState,MainPID,Job'])
         result = dict(line.split('=', 1) for line in raw.decode().splitlines())
-        if name.endswith(('.socket','.timer')) and 'MainPID' not in result:
+        if name.endswith(('.socket','.timer','.target')) and 'MainPID' not in result:
             result['MainPID'] = '0'
         if (name.endswith('.socket') and result.get('ActiveState') == 'active'
                 and result.get('SubState') in ('listening', 'running')):
@@ -222,6 +198,13 @@ class CodeUpdate:
         if action == 'stop' and (observed['ActiveState'] != 'inactive' or observed['MainPID'] != '0'):
             raise ValueError('unit_stop_incomplete')
         self.record['last_units'][name] = observed
+        if (self.record.get('certificate_manifest_update') and action == 'stop'
+                and name == certificate_update.SOCKET):
+            gate = self.unit(certificate_update.GATE)
+            if gate != self.record['last_units'][certificate_update.GATE]:
+                if not self.quiet_state(certificate_update.GATE, gate):
+                    raise ValueError('certificate_update_gate_dependency_state')
+                self.record['last_units'][certificate_update.GATE] = gate
         self.record['operation_started'] = None
         self.save()
 
@@ -294,6 +277,10 @@ class CodeUpdate:
         if any(name not in operations for name in receipt['unit_files']
                if '/etc/systemd/system/'+name in candidates and '/etc/systemd/system/'+name not in companion_changes):
             raise ValueError('changed_unit_missing_lifecycle_operation')
+        transition, actor_candidates = certificate_update.plan_files(self, bound, receipt)
+        if transition:
+            checked = certificate_update.extend_contract(self, checked, receipt['unit_files'])
+            candidates.update(actor_candidates)
         changes_auth_link = auth_links and auth_links['change']
         if (changes_auth_link or any(path.endswith(('.php', '.inc')) for path in candidates)) and 'php8.4-fpm.service' not in checked['stop']:
             raise ValueError('PHP_update_requires_FPM_stop_start')
@@ -312,7 +299,7 @@ class CodeUpdate:
         self.record = {'phase': 'planned', 'monitor_environment': monitor_environment, 'contract': checked, 'old_receipt': receipt,
                        'receipt_before': metadata, 'candidates': candidates, 'before_units': original_units,
                        'last_units': dict(original_units), 'operation_started': None, 'activated': False,
-                       'roundcube_auth_links':auth_links}
+                       'roundcube_auth_links':auth_links, 'certificate_manifest_update':transition}
         self.save()
         return {'phase': 'planned', 'files': len(candidates), 'version': checked['to_version']}
 
@@ -323,6 +310,7 @@ class CodeUpdate:
         output = self.directory/'staged-code'
         output.mkdir(mode=0o700)
         bound = self.render(self.record['old_receipt'])
+        self.bind_staged_certificate(bound)
         for path, entry in self.record['candidates'].items():
             raw = bound[entry['source']]
             if sha(raw) != entry['after']['sha256']:
@@ -346,6 +334,7 @@ class CodeUpdate:
         self.load()
         if self.record['phase'] != 'staged':
             raise ValueError('update_activate_order')
+        certificate_update.before_activation(self)
         value = self.record['contract']
         self.record['phase'] = 'activation_started'
         self.record['activated'] = True
@@ -361,6 +350,7 @@ class CodeUpdate:
                 self.save()
             else:
                 raise ValueError('update_actor_not_quiet:'+name)
+            certificate_update.wait_for_health(self, name)
         for path, entry in self.record['candidates'].items():
             self.check_aliases(self.record['old_receipt'])
             target = self.files.target(path)
@@ -372,6 +362,7 @@ class CodeUpdate:
                 raise ValueError('staged_code_drift')
             self.files.write(path, raw, entry['after']['mode'], entry['after']['uid'], entry['after']['gid'],
                              expected_before=entry['before'])
+        certificate_update.verify_pins(self, 'after')
         auth_links = self.record.get('roundcube_auth_links')
         if auth_links and auth_links['change']:
             self.auth_links.update(auth_links)
@@ -400,6 +391,7 @@ class CodeUpdate:
         for path, item in self.record['candidates'].items():
             if self.live(path)[1] != item['after']:
                 raise ValueError('update_health_file_drift')
+        certificate_update.verify_pins(self, 'after')
         if self.record.get('roundcube_auth_links'):
             self.auth_links.verify_update(self.record['roundcube_auth_links'])
         for name in self.record['contract']['health']:
@@ -426,7 +418,7 @@ class CodeUpdate:
         for path, item in self.record['candidates'].items():
             if path.startswith('/etc/systemd/system/'):
                 receipt['unit_files'][Path(path).name] = item['after']
-            else:
+            elif path not in certificate_update.CONFIGS:
                 receipt['code'][path] = item['after']
         receipt['version'] = self.record['contract']['to_version']
         return receipt
@@ -444,6 +436,7 @@ class CodeUpdate:
         for entry in self.files.entries:
             if self.files.mark_unapplied(entry) or entry['phase'] == 'restored':
                 continue
+            certificate_update.recover_write(self, entry, self.record['candidates'].get(entry['path']))
             if entry['phase'] != 'written' or self.live(entry['path'])[1] != entry['after']:
                 raise ValueError('rollback_held_unknown_file_state')
         value = self.record['contract']
@@ -455,6 +448,7 @@ class CodeUpdate:
             for name in value['pause']+value['stop']:
                 if self.unit(name)['ActiveState'] == 'active':
                     self.operation('stop', name)
+                certificate_update.wait_for_health(self, name)
         from dkim_readiness import update_rollback
         update_rollback(self)
         result = self.files.restore()
@@ -462,6 +456,7 @@ class CodeUpdate:
             raise ValueError('rollback_held_file_restore')
         self.auth_links.restore_update()
         if self.record['activated']:
+            certificate_update.verify_pins(self, 'before')
             if any(path.startswith('/etc/systemd/system/') for path in self.record['candidates']):
                 self.commands.run('restore_systemd', ['/usr/bin/systemctl', 'daemon-reload'])
             for name in value['start']+value['pause']:

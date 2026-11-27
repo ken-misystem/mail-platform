@@ -50,8 +50,10 @@ final class UpdateController
             if(!is_int($s['revision']??null)||!in_array($s['mode']??null,['manual','automatic'],true)){throw new \RuntimeException('update_status');}
             $e=static fn(mixed $v):string=>htmlspecialchars((string)$v,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8');
             $nonce=bin2hex(random_bytes(16));$pool=$request->getSession()->get(self::SESSION,[]);$pool=is_array($pool)?array_slice($pool,-7,null,true):[];
-            $pool[$nonce]=['id'=>$actor->id,'epoch'=>$actor->epoch,'revision'=>$s['revision'],'at'=>time()];$request->getSession()->set(self::SESSION,$pool);
             $lookupFailed=($s['source_failure']['stage']??null)==='lookup';
+            $target=$lookupFailed?null:($s['available_version']??null);
+            $target=is_string($target)&&preg_match('/\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z/',$target)===1?$target:null;
+            $pool[$nonce]=['id'=>$actor->id,'epoch'=>$actor->epoch,'revision'=>$s['revision'],'at'=>time(),'version'=>$target];$request->getSession()->set(self::SESSION,$pool);
             $html=self::failureNotice($s).'<p>現在のバージョン：'.$e($s['installed_version']).'</p><p>新しいバージョン：'.$e($lookupFailed?'未確認':($s['available_version']??'確認待ち')).'</p>'
                 .'<p>更新状態：'.$e($s['phase']).'</p><p>正式リリースの署名と内容を確認して更新します。メール・利用者設定は保持します。</p>'
                 .'<p>更新方式と対象機能の停止影響を確認して適用してください。</p>'
@@ -59,7 +61,8 @@ final class UpdateController
                 .'<input type="hidden" name="nonce" value="'.$nonce.'"><label>更新方法<select name="mode">'
                 .'<option value="manual"'.($s['mode']==='manual'?' selected':'').'>通知を確認して手動で更新</option>'
                 .'<option value="automatic"'.($s['mode']==='automatic'?' selected':'').'>正式リリースを自動更新</option></select></label>'
-                .'<button name="action" value="settings">更新方法を保存</button><button name="action" value="apply">今すぐ更新を予約</button></form>';
+                .'<button name="action" value="settings">更新方法を保存</button>'
+                .($target===null?'':'<button name="action" value="apply">'.$e($target).' の更新を予約</button>').'</form>';
             $pending=$s['retirement_pending']??[];
             if (is_array($pending)&&$pending!==[]) {
                 $html.='<p>新しい世代へ切替え済みです。既存接続の終了を待って旧世代を停止します。</p><ul>';
@@ -89,7 +92,12 @@ final class UpdateController
         unset($pool[$nonce]);$request->getSession()->set(self::SESSION,$pool);
         if(!in_array($in['action']??null,['settings','apply'],true)||!in_array($in['mode']??null,['manual','automatic'],true)){return $this->page('',400);}
         try{
-            $this->updates->call(['operation'=>$in['action'],'mode'=>$in['mode'],'revision'=>$old['revision'],'actor'=>(string)$actor->id,'request_id'=>$nonce]);
+            $call=['operation'=>$in['action'],'mode'=>$in['mode'],'revision'=>$old['revision'],'actor'=>(string)$actor->id,'request_id'=>$nonce];
+            if($in['action']==='apply'){
+                if(!is_string($old['version']??null)){return $this->page('<p>更新画面を開き直し、対象版を確認してください。</p>',409);}
+                $call['version']=$old['version'];
+            }
+            $this->updates->call($call);
             return $this->page('<p>受け付けました。更新画面で状態と結果を確認してください。</p>');
         }catch(\Throwable){return $this->page('<p>受付結果を確認できません。再実行する前に更新状態を確認してください。</p>',503);}
     }

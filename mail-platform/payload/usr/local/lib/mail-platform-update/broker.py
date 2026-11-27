@@ -41,6 +41,7 @@ def operation(req,root=ROOT):
   return {'status':'ok',**alert_settings.status()}
  notifications=req.get('operation')=='notification_delivery'
  fields={'operation','revision','actor','request_id'}
+ if req.get('operation')=='apply':fields.add('version')
  require(set(req)==fields|({'enabled'} if notifications else {'mode'}),'fields')
  if notifications:
   require(type(req['enabled']) is bool and isinstance(req['revision'],str) and re.fullmatch('[a-f0-9]{64}',req['revision']),'notification_request')
@@ -57,7 +58,8 @@ def operation(req,root=ROOT):
  if notifications:alert_settings.change(req['enabled'],req['revision'])
  elif req['operation']=='settings':save(root/'policy.json',policy(current,req['mode'],req['revision']))
  else:
-  require(not(root/'manual-request.json').exists(),'request_pending');save(root/'manual-request.json',{'request_id':req['request_id'],'actor':req['actor']})
+  from manual_update_request import reserve
+  record['reservation']=reserve(root,req['request_id'],req['actor'],req['version'])
  record['phase']='accepted';save(receipt,record);return {'status':'ok','request_id':req['request_id']}
 
 def serve():

@@ -76,7 +76,7 @@ def validate(value, p):
     return value
 
 
-def cycle(store, observation, p, enabled, adapters, clock, archive=None):
+def cycle(store, observation, p, enabled, adapters, clock, archive=None, update_notes=None):
     """One locked cycle. Each channel can fail without blocking the other.
 
     Only public outcome dictionaries survive adapter errors. The reserved state
@@ -100,7 +100,15 @@ def cycle(store, observation, p, enabled, adapters, clock, archive=None):
             state['delivery']['events'] = [e for e in state['delivery']['events'] if e['id'] not in archived_ids]
             state['archived'] += len(archived_ids)
             store.save(validate(state, p))
+    old_count = len(state['detector']['outbox'])
     state['detector'] = a.advance(state['detector'], observation, clock(), p)
+    notes = {}
+    if update_notes is not None:
+        events = state['detector']['outbox']
+        try:
+            notes = update_notes.sync_notes(events, events[old_count:], observation)
+        except (ValueError, OSError):
+            pass  # Continue delivering even if optional context cannot be retained.
     state['delivery'] = delivery.sync(state['delivery'], state['detector']['outbox'], UNITS, p)
     store.save(validate(state, p))
     outcomes = {}
@@ -118,6 +126,8 @@ def cycle(store, observation, p, enabled, adapters, clock, archive=None):
             outcomes[channel] = 'no_submission'
             continue
         try:
+            if event['id'] in notes:
+                event['note'] = notes[event['id']]
             result = adapters[channel](copy.deepcopy(event))
             next_ledger = delivery.finish(state['delivery'], event['id'], channel, result, clock(), p)
         except Exception as exc:

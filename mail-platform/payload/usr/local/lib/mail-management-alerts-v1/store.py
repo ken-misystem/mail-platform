@@ -42,6 +42,7 @@ def directory(path):
 
 
 class Store:
+    filename = 'state.json'
     def __init__(self, path, validator):
         self.path, self.validator = path, validator
         self.fd = self.lock = None
@@ -74,14 +75,14 @@ class Store:
 
     def _read(self):
         try:
-            fd = os.open('state.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
+            fd = os.open(self.filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.fd)
         except FileNotFoundError:
             return None, None
         try:
             before = os.fstat(fd)
             self._guard(before)
             raw = os.pread(fd, before.st_size+1, 0)
-            after = os.stat('state.json', dir_fd=self.fd, follow_symlinks=False)
+            after = os.stat(self.filename, dir_fd=self.fd, follow_symlinks=False)
             need(identity(before) == identity(os.fstat(fd)) == identity(after) and len(raw) == before.st_size, 'store_read_drift')
             return raw, identity(after)
         finally:
@@ -126,7 +127,7 @@ class Store:
             os.close(fd)
         _, current = self._read()
         need(current == self.previous, 'state_changed_before_replace')
-        os.rename(name, 'state.json', src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        os.rename(name, self.filename, src_dir_fd=self.fd, dst_dir_fd=self.fd)
         os.fsync(self.fd)
         check, updated = self._read()
         need(check == raw, 'state_readback')
@@ -139,6 +140,54 @@ class Store:
         held = os.fstat(self.lock)
         self._guard(current)
         need(identity(current) == identity(held), 'state_lock_replaced')
+
+
+class UpdateNotes(Store):
+    """A bounded companion to the outbox. The existing ledger stays rollback-readable."""
+    filename = 'update-notes.json'
+
+    def __init__(self, journal):
+        super().__init__(journal.path, self.validate_notes)
+        self.fd, self.lock = journal.fd, journal.lock  # Borrow the running cycle's lock.
+
+    @staticmethod
+    def validate_notes(notes):
+        need(type(notes) is dict and len(notes)<=4096,'note_count')
+        for key,note in notes.items():
+            need(re.fullmatch('[a-f0-9]{64}',key) and type(note) is dict and
+                 set(note) <= {'update','units'}, 'note_shape')
+            units = note.get('units',{})
+            need(type(units) is dict and len(units)<=512, 'unit_note_count')
+            for unit,row in units.items():
+                need(re.fullmatch(r'[a-zA-Z0-9@_.-]{1,160}',unit) and type(row) is dict and
+                     set(row)=={'load','active','result','main_exit'} and
+                     all(isinstance(row[k],str) and re.fullmatch('[a-z-]{0,24}',row[k]) for k in ('load','active','result'))
+                     and (row['main_exit'] is None or type(row['main_exit']) is int), 'unit_note_data')
+            if 'update' not in note: continue
+            item=note['update']
+            need(type(item) is dict and
+                 set(item) in ({'reason','run'},{'reason','run','next'}) and
+                 item['reason'] in ('busy','busy_os','lookup') and type(item['run']) is int and
+                 0<item['run']<2**31*4 and ('next' not in item or type(item['next']) is int and
+                 item['run']<item['next']<=item['run']+86400),'note_data')
+        return notes
+
+    def sync_notes(self, events, fresh, observation):
+        old = self.load() or {}
+        notes = {e['id']:old[e['id']] for e in events if e['id'] in old}
+        for e in fresh:
+            units = observation.get('unit_details',{})
+            note = {}
+            for c in e['changes']:
+                unit=c['key'].removeprefix('units/')
+                if c['after']!='ok' and unit in units:
+                    note.setdefault('units',{})[unit]=units[unit]
+                if unit=='mail-platform-update.service' and c['after']=='warning' and 'update_detail' in observation:
+                    note['update']=observation['update_detail']
+            if note: notes[e['id']]=note
+        if notes != old:
+            self.save(notes)
+        return notes
 
 
 class Archive:

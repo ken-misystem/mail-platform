@@ -54,7 +54,16 @@ def latest(repository,token=None):
  require(isinstance(rows,list)and len(rows)<=100,'release_list')
  stable=[row for row in rows if isinstance(row,dict)and not row.get('draft')and not row.get('prerelease')and isinstance(row.get('tag_name'),str)and re.fullmatch(r'v(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)',row['tag_name'])]
  if not stable:return None
- v=max(stable,key=lambda row:version(row['tag_name'][1:]))
+ return release_assets(max(stable,key=lambda row:version(row['tag_name'][1:])))
+
+def tagged(repository,target,token=None):
+ version(target)
+ tag='v'+target
+ item=json.loads(request('https://api.github.com/repos/'+repo(repository)+'/releases/tags/'+tag,1024*1024,token))
+ require(isinstance(item,dict)and item.get('tag_name')==tag,'manual_update_reserved_tag_mismatch')
+ return release_assets(item)
+
+def release_assets(v):
  require(not v.get('draft')and not v.get('prerelease')and isinstance(v.get('assets'),list),'not_stable_release')
  wanted={}
  for a in v['assets']:

@@ -121,6 +121,49 @@ def event_check(event, units):
     a.need(len(set(keys)) == len(keys), 'duplicate_event_key')
 
 
+def explanation(change, note):
+    key, level = change['key'], change['after']
+    if level == 'ok':
+        return '正常を再確認しました。', '通常の監視を継続します。'
+    domain, item = key.split('/',1)
+    row = note.get('units',{}).get(item)
+    status = ''
+    if row:
+        status = '状態 '+row['active']
+        if row['result']: status += '、結果 '+row['result']
+        if row['main_exit'] is not None: status += '、終了値 '+str(row['main_exit'])
+        status += '。'
+    if key == 'units/'+a.UPDATE_UNIT:
+        if level == 'critical':
+            return ('更新サービスの異常を検出しました。'+status,
+                    '管理画面の更新履歴で適用・切戻し結果を確認してください。')
+        detail = note.get('update')
+        if detail:
+            reason = {'busy_os':'OS整合確認が更新ロックを保持していました（update_busy）。今回の適用は未開始です。',
+                      'busy':'更新ロックが使用中でした（update_busy）。保持元は未確認です。今回の適用は未開始です。',
+                      'lookup':'配布先から新版情報を取得できませんでした。'}[detail['reason']]
+            if 'next' in detail:
+                when = a.dt.datetime.fromtimestamp(detail['next'], a.dt.timezone(a.dt.timedelta(hours=9)))
+                minutes = (detail['next']-detail['run']+59)//60
+                schedule = f'失敗時点の次回予定は約{minutes}分後（{when:%m/%d %H:%M} JST）。'
+            else:
+                schedule = '次回の定期実行で再確認します。時刻は未確認です。'
+            action = ('新版情報の取得を再試行します。' if detail['reason']=='lookup' else
+                      '新版があれば、自動更新または適用予約済みの場合に適用を再試行します。')
+            return reason, schedule+action
+        return '更新確認または適用前の処理を完了できませんでした。', '次回の定期実行と管理画面の更新履歴を確認してください。'
+    if domain == 'units':
+        return '監視対象が期待する起動状態または終了結果を満たしていません。'+status, '管理画面の稼働状況と対象サービスのログを確認してください。'
+    if domain.endswith('_storage'):
+        resource = '空き容量' if item=='bytes' else '空きinode数'
+        return resource+'が監視しきい値を下回りました。', 'ディスク使用状況を確認してください。'
+    if domain in ('queue','backup_queue'):
+        return NAMES[key]+'を監視で検出しました。', '管理画面の隔離・配送待ちと配送ログを確認してください。'
+    if domain in ('certificate','client_certificates'):
+        return label(key, ())+'を監視で検出しました。', '証明書の有効期限・失効リスト・対象サービスの状態を確認してください。'
+    return label(key, ())+'を検出し、現在の状態を確認できません。', '管理画面で最終観測時刻と収集サービスのログを確認してください。'
+
+
 def payload(event, units, *, discord_mention=False):
     event_check(event, units)
     levels = {'ok': '正常', 'warning': '警告', 'critical': '重大'}
@@ -129,14 +172,16 @@ def payload(event, units, *, discord_mention=False):
     important = discord_mention and any(c['after'] == 'critical' for c in event['changes'])
     head = (['@here'] if important else []) + ['mx.service.invalid：内部障害通知', when, '通知ID：'+event['id']]
     lines = []
-    for c in event['changes']:
+    for c in sorted(event['changes'], key=lambda c: -a.LEVELS[c['after']]):
         name = label(c['key'], units)
         if c['key'] == 'units/'+a.UPDATE_UNIT and c['after'] == 'warning':
-            line = name+'：定期チェック失敗（警告）'
+            line = name+'：警告'
         else:
             line = name+'：'+levels[c['before']]+' → '+levels[c['after']]
         if c['after'] == 'ok':
             line += '（復旧）'
+        reason, following = explanation(c, event.get('note',{}))
+        line += '\n理由：'+reason+'\n次の対応：'+following
         # Keep the original event in private state; never silently split into many posts.
         if len('\n'.join(head+lines+[line])) > 1750:
             break

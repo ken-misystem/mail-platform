@@ -20,6 +20,7 @@ from code_attributes import attributes as code_attributes
 
 class GenerationUpdate(CodeUpdate):
     allow_registered_additions = False
+    certificate_transaction = False
     def __init__(self, payload, transaction, root='/', commands=None):
         super().__init__(payload, transaction, root, commands)
         self.record_path = self.directory/'generation-update.json'
@@ -32,7 +33,7 @@ class GenerationUpdate(CodeUpdate):
         return (self.allow_registered_additions or auth_asset) and any(target.startswith(root+'/')
             for component in config['components'].values() for root in component['roots'])
 
-    def partition_changes(self, changes, config):
+    def partition_changes(self, changes, config, bound, receipt):
         return changes
 
     def select_changes(self, contract, config, changes):
@@ -101,7 +102,7 @@ class GenerationUpdate(CodeUpdate):
             current, metadata = self.live('/etc/systemd/system/' + name)
             if metadata != expected or sha(bound['blueprint/systemd/' + name]) != sha(current):
                 raise ValueError('availability_unit_migration_required')
-        changes = self.partition_changes(changes, config)
+        changes = self.partition_changes(changes, config, bound, receipt)
         contract = self.update_contract(receipt, config, changes)
         owners = self.select_changes(contract, config, changes)
         generation = self.next_generation(bundle['version'])
