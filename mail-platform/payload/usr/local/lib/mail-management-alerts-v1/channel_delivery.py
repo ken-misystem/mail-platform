@@ -124,14 +124,33 @@ def event_check(event, units):
 def explanation(change, note):
     key, level = change['key'], change['after']
     if level == 'ok':
+        if key == 'units/'+a.DEFINITIONS_UNIT:
+            return '鮮度基準内の日次定義をClamAVが読み込んだことを確認しました。', '通常の定期確認を継続します。'
         return '正常を再確認しました。', '通常の監視を継続します。'
     domain, item = key.split('/',1)
     row = note.get('units',{}).get(item)
+    if key == 'units/'+a.DEFINITIONS_UNIT and row:
+        next_check = '定期タイマーが稼働していれば、次の周期（通常約1時間）で公式配布先を再確認します。'
+        if row['result'] == a.DEFINITION_RESULTS['same_daily_stale']:
+            return ('FreshClamは更新不要と記録しました。ClamAVが読み込んでいる同じ版の日次定義が作成から48時間を超えています。',
+                    next_check+'新しい定義はClamAVでの読込みまで確認します。')
+        if row['result'] == a.DEFINITION_RESULTS['daily_freshness']:
+            return ('FreshClamは正常終了しました。日次定義が鮮度基準を満たさず、後処理が終了値1で失敗しました。',
+                    next_check+'定義の版と作成日時を確認してください。')
+        if row['result'] == a.DEFINITION_RESULTS['daily_future']:
+            return '日次定義の作成日時がサーバー時刻より1時間を超えて進んでいます。', 'サーバー時刻と定義の作成日時を確認してください。'
+        if row['result'] == a.DEFINITION_RESULTS['not_loaded']:
+            return 'ClamAVがディスク上の日次定義を読み込んだことを確認できませんでした。', next_check+'ClamAVのログを確認してください。'
+        if row['active'] == 'failed' and row['main_exit'] not in (0, None):
+            return 'FreshClamが終了値 '+str(row['main_exit'])+' で失敗しました。', next_check+'FreshClamのログを確認してください。'
     status = ''
     if row:
         status = '状態 '+row['active']
         if row['result']: status += '、結果 '+row['result']
-        if row['main_exit'] is not None: status += '、終了値 '+str(row['main_exit'])
+        if key == 'units/'+a.DEFINITIONS_UNIT and row['active']=='failed' and row['main_exit']==0:
+            status += '、主処理の終了値0（失敗した工程は未確認）'
+        elif row['main_exit'] is not None:
+            status += '、終了値 '+str(row['main_exit'])
         status += '。'
     if key == 'units/'+a.UPDATE_UNIT:
         if level == 'critical':

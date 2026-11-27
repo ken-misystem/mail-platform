@@ -14,6 +14,20 @@ DIRECTORY = Path('/var/lib/mail-management-operations-v1')
 SOURCE_SHA = 'fa793434ffe8f5d947e6b2f21af25f0f6706a58ed96cc12802e1b3080c06bb9e'
 GROUP = 113  # Existing verified mailadmin group; no identity/grant creation.
 UPDATE_UNIT = 'mail-platform-update.service'
+DEFINITIONS_UNIT = 'mail-protection-definitions-v1.service'
+DEFINITIONS_CHECK = '/opt/mail-antivirus-v1/definition_status.py'
+DEFINITION_ERRORS = {
+    'ValueError: official_daily_stale': 'daily_freshness',
+    'ValueError: official_daily_future': 'daily_future',
+    'ValueError: official_database_not_loaded': 'not_loaded',
+    'ValueError: official_database_reload_unverified': 'not_loaded',
+    'ValueError: official_database_version_reversed': 'not_loaded',
+    'ValueError: official_clamd_reply': 'not_loaded',
+    'ValueError: official_clamd_peer': 'not_loaded',
+}
+STALE_VERSION = r'MAIL_PLATFORM_AV_DAILY_STALE_VERSION=([1-9][0-9]{0,9})'
+DAILY_LOAD_CONFIRMED = 'MAIL_PLATFORM_AV_DAILY_LOAD_CONFIRMED=1'
+FRESHCLAM_CURRENT = r'daily\.(?:cvd|cld) database is up-to-date \(version: ([1-9][0-9]{0,9}),[^\r\n]*\)'
 UPDATE_MARKER = 'MAIL_PLATFORM_PERIODIC_LOOKUP_FAILED=1'
 MARKERS = {UPDATE_MARKER:'lookup', 'MAIL_PLATFORM_PRE_APPLY_BUSY=unknown':'busy',
            'MAIL_PLATFORM_PRE_APPLY_BUSY=os_reconcile':'busy_os'}
@@ -95,15 +109,106 @@ def periodic_update_failure(snapshot, capture):
     return None
 
 
-def write_snapshot(directory_fd, result, periodic=None):
+def definition_update_failure(snapshot, capture):
+    """Tie completion or the exact post-check error to the sampled unit state."""
+    units = snapshot['checks']['units']
+    if units['status'] != 'ok':
+        return None
+    unit = units['data'].get(DEFINITIONS_UNIT, {})
+    status = (unit.get('load'), unit.get('active'), unit.get('result'), unit.get('main_exit'))
+    failed = status == ('loaded', 'failed', 'exit-code', 0)
+    completed = status == ('loaded', 'inactive', 'success', 0)
+    if not (failed or completed):
+        return None
+    command = ('/usr/bin/systemctl', 'show', '--no-pager',
+               '--property=InvocationID,ActiveState,Result,ExecMainStatus,ExecStartPost', DEFINITIONS_UNIT)
+    try:
+        before, meta = capture(command, 8192, timeout=3)
+        if meta['reason'] is not None:
+            return None
+        fields = dict(line.split('=', 1) for line in before.decode().splitlines())
+        invocation = fields.pop('InvocationID', '')
+        post = fields.pop('ExecStartPost', '')
+        if (fields != {'ActiveState':status[1], 'Result':status[2], 'ExecMainStatus':'0'}
+                or post.count('{') != 1 or post.count('}') != 1
+                or not re.search(r'(?:^|\s)'+re.escape(DEFINITIONS_CHECK)+r'\s*;', post)
+                or re.findall(r';\s*code=([^;\s]+)\s*;\s*status=([^\s;}]+)', post)
+                != [('exited', '1' if failed else '0')]):
+            return None
+        if completed:
+            pid = re.search(r';\s*pid=([1-9][0-9]*)\s*;', post)
+            if pid is None:
+                return None
+            marker = ('/usr/bin/journalctl', '--boot', '--no-pager', '--output=json', '--lines=2',
+                      '--output-fields=MESSAGE,_PID,_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID',
+                      'MESSAGE='+DAILY_LOAD_CONFIRMED, '_PID='+pid[1], '_SYSTEMD_UNIT='+DEFINITIONS_UNIT)
+            raw, meta = capture(marker, 4096, timeout=3)
+            if meta['reason'] is not None or len(raw.splitlines()) != 1:
+                return None
+            row = json.loads(raw)
+            if (row.get('MESSAGE'), row.get('_PID'), row.get('_SYSTEMD_UNIT')) != (
+                    DAILY_LOAD_CONFIRMED, pid[1], DEFINITIONS_UNIT):
+                return None
+            if re.fullmatch('[0-9a-f]{32}', invocation) and int(invocation, 16) and row.get('_SYSTEMD_INVOCATION_ID') != invocation:
+                return None
+            after, meta = capture(command, 8192, timeout=3)
+            if meta['reason'] is None and before == after:
+                return {'reason':'loaded_and_complete', 'post_exit':0}
+            return None
+        if not re.fullmatch(r'[0-9a-f]{32}', invocation) or not int(invocation, 16):
+            return None
+        grep = '|'.join(re.escape(msg) for msg in DEFINITION_ERRORS) + '|' + STALE_VERSION + '|' + FRESHCLAM_CURRENT
+        query = ('/usr/bin/journalctl', '--boot', '--no-pager', '--output=json',
+                 '--output-fields=MESSAGE,_SYSTEMD_UNIT,_SYSTEMD_INVOCATION_ID',
+                 '--grep=^(?:'+grep+')$', '--lines=5',
+                 '_SYSTEMD_UNIT='+DEFINITIONS_UNIT, '_SYSTEMD_INVOCATION_ID='+invocation)
+        raw, meta = capture(query, 8192, timeout=3)
+        lines = raw.splitlines()
+        if meta['reason'] is not None or not 1 <= len(lines) <= 4:
+            return None
+        rows = [json.loads(line) for line in lines]
+        if any((row.get('_SYSTEMD_UNIT'), row.get('_SYSTEMD_INVOCATION_ID')) !=
+               (DEFINITIONS_UNIT, invocation) for row in rows):
+            return None
+        stamps = [row.get('__REALTIME_TIMESTAMP') for row in rows]
+        if any(not isinstance(stamp, str) or not re.fullmatch('[0-9]{1,19}', stamp) for stamp in stamps):
+            return None
+        stamps = list(map(int, stamps))
+        if len(stamps) != len(set(stamps)):
+            return None
+        # journalctl --grep returns newest first on Debian; use recorded times.
+        ordered = sorted(zip(stamps, rows), key=lambda entry: entry[0])
+        messages = [row['MESSAGE'] for _, row in ordered]
+        reason = DEFINITION_ERRORS.get(messages[-1])
+        if reason is None:
+            return None
+        run_epoch = ordered[-1][0] // 1000000
+        if len(messages) == 3 and reason == 'daily_freshness':
+            current = re.fullmatch(FRESHCLAM_CURRENT, messages[0])
+            on_disk = re.fullmatch(STALE_VERSION, messages[1])
+            if current and on_disk and current[1] == on_disk[1]:
+                reason = 'same_daily_stale'
+        if not 0 < run_epoch <= int(datetime.fromisoformat(snapshot['observed_utc']).timestamp()):
+            return None
+        after, meta = capture(command, 8192, timeout=3)
+        if meta['reason'] is None and before == after:
+            return {'invocation':invocation, 'run_epoch':run_epoch, 'reason':reason, 'post_exit':1}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return None
+
+
+def write_snapshot(directory_fd, result, periodic=None, definitions=None):
     need(result['source_sha256'] == SOURCE_SHA and result['operation'] == 'management-operations-read-v1')
     raw = (json.dumps(result, separators=(',', ':'), ensure_ascii=True) + '\n').encode('ascii')
     need(0 < len(raw) <= 65536)
-    if periodic is not None:
-        proof = dict(periodic, snapshot_sha256=hashlib.sha256(raw).hexdigest())
+    for filename, detail in (('periodic-update-proof.json', periodic), ('definition-update-proof.json', definitions)):
+        if detail is None:
+            continue
+        proof = dict(detail, snapshot_sha256=hashlib.sha256(raw).hexdigest())
         encoded = json.dumps(proof, separators=(',', ':')).encode('ascii')
         try:
-            write_public(directory_fd, 'periodic-update-proof.json', encoded)
+            write_public(directory_fd, filename, encoded)
         except (OSError, ValueError):
             pass  # Publish the normal snapshot even if the optional proof is unavailable.
     write_public(directory_fd, 'snapshot.json', raw)
@@ -152,7 +257,8 @@ def run():
         library = runtime()
         result = library['collect']()
         periodic = periodic_update_failure(result, library['capture'])
-        write_snapshot(directory, result, periodic)
+        definitions = definition_update_failure(result, library['capture'])
+        write_snapshot(directory, result, periodic, definitions)
         return 0 if result['status'] == 'ok' else 1
     finally:
         for fd in (lock, directory, parent):

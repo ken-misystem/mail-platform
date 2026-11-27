@@ -22,6 +22,28 @@ CERT_CODES = ('private_unit_not_active', 'gate_observation_missing', 'gate_obser
               'health_collection_failed', 'health_snapshot_stale')
 LEVELS = {'ok': 0, 'warning': 1, 'critical': 2}
 UPDATE_UNIT = 'mail-platform-update.service'
+DEFINITIONS_UNIT = 'mail-protection-definitions-v1.service'
+DEFINITION_RESULTS = {'daily_freshness':'definition-freshness',
+                      'same_daily_stale':'definition-current',
+                      'daily_future':'definition-clock', 'not_loaded':'definition-load-lag'}
+
+
+def confirmed_definition_failure(proof, observed, snapshot):
+    if not isinstance(proof, dict) or set(proof) != {
+            'invocation','run_epoch','snapshot_sha256','reason','post_exit'}:
+        return False
+    invocation, run = proof['invocation'], proof['run_epoch']
+    return (isinstance(invocation, str) and re.fullmatch('[0-9a-f]{32}', invocation) is not None
+            and bool(int(invocation, 16)) and type(run) is int and 0 < run <= observed
+            and type(proof['post_exit']) is int and proof['post_exit'] == 1
+            and proof['reason'] in DEFINITION_RESULTS
+            and proof['snapshot_sha256'] == hashlib.sha256(snapshot).hexdigest())
+
+
+def confirmed_definition_completion(proof, snapshot):
+    return (isinstance(proof, dict) and set(proof) == {'reason','post_exit','snapshot_sha256'}
+            and proof['reason'] == 'loaded_and_complete' and type(proof['post_exit']) is int
+            and proof['post_exit'] == 0 and proof['snapshot_sha256'] == hashlib.sha256(snapshot).hexdigest())
 
 
 def periodic_update_run(proof, units, observed, snapshot):
@@ -98,7 +120,7 @@ def policy(raw):
     return p
 
 
-def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None):
+def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None, definition_failure=None):
     """Finite projection from the pinned producer; malformed input never recovers.
 
     A None domain denotes unknown, so a failed check cannot recover its incidents.
@@ -118,6 +140,8 @@ def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None):
         result = {'snapshot': {}, 'backup_queue': None, **{name: None for name in CHECKS}}
         update_run = None
         unit_details = {}
+        defer_definition = False
+        awaiting_definition = False
         for name in CHECKS:
             c = checks[name]
             need(type(c) is dict and c['status'] in ('ok', 'fail'), 'check_status')
@@ -146,6 +170,19 @@ def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None):
                     if failed or inactive:
                         findings[unit] = 'warning' if unit == UPDATE_UNIT and update_run is not None else 'critical'
                         unit_details[unit] = {k:v[k] for k in ('load','active','result','main_exit')}
+                        if (unit == DEFINITIONS_UNIT and (v['load'], v['active'], v['result'], v['main_exit'])
+                                == ('loaded', 'failed', 'exit-code', 0)
+                                and confirmed_definition_failure(definition_failure, observed, raw)):
+                            # The existing note format allows a finite result label.
+                            # Keep main_exit intact so stored notes remain rollback-readable.
+                            reason = definition_failure['reason']
+                            unit_details[unit]['result'] = DEFINITION_RESULTS[reason]
+                            if reason == 'same_daily_stale':
+                                awaiting_definition = True
+                                del findings[unit]
+                    elif unit == DEFINITIONS_UNIT:
+                        defer_definition = ((v['active'], v['result'], v['main_exit']) != ('inactive', 'success', 0)
+                                            or not confirmed_definition_completion(definition_failure, raw))
             elif name in ('system_storage', 'mail_storage'):
                 total = number(data['total_bytes'], 1)
                 free = number(data['available_bytes'], 0, total)
@@ -207,6 +244,10 @@ def observations(raw, now, p, unit_names, oneshots, *, periodic_failure=None):
                     findings['expired'] = 'critical'
             result[name] = findings
         observation = {'token': observed, 'domains': result, 'unit_details':unit_details}
+        if defer_definition:
+            observation['defer_definition'] = True
+        if awaiting_definition:
+            observation['awaiting_definition'] = True
         if update_run is not None:
             observation['periodic_update_run'] = update_run
             detail = {'reason':periodic_failure.get('reason','lookup'), 'run':update_run}
@@ -239,6 +280,8 @@ def advance(state, observation, now, p):
             keys.update(domain+'/'+name for name in findings)
     for key in sorted(keys):
         domain, name = key.split('/', 1)
+        if key == 'units/'+DEFINITIONS_UNIT and observation.get('defer_definition'):
+            continue
         if domain not in domains or domains[domain] is None:
             continue
         if domain == 'snapshot' and name not in domains[domain] and any(
@@ -268,6 +311,10 @@ def advance(state, observation, now, p):
         # A stale/invalid observation uses wall-clock time; a fresh recovery uses
         # the producer timestamp, which can be lower. Other domains must advance.
         need(domain == 'snapshot' or token > item['token'], 'observation_moved_backwards')
+        if key == 'units/'+DEFINITIONS_UNIT and observation.get('awaiting_definition'):
+            # Clear the alert without recording a verified fresh-definition recovery.
+            item.update(token=token, pending='ok', current='ok', count=0)
+            continue
         item['token'] = token
         item['count'] = min(1000, item['count']+1) if item['pending'] == level else 1
         item['pending'] = level

@@ -173,8 +173,13 @@ def main():
             proof = alerts.decode(read_file(str(Path(SNAPSHOT).with_name('periodic-update-proof.json')), 1024))
         except (OSError, ValueError):
             proof = None
+        try:
+            definitions = alerts.decode(read_file(str(Path(SNAPSHOT).with_name('definition-update-proof.json')), 1024))
+        except (OSError, ValueError):
+            definitions = None
         observation = alerts.observations(raw, int(time.time()), policy, engine.UNITS,
-                        periodic_failure=proof, oneshots=('mail-pop-general-dispatch.service', 'mail-junk-digest-general.service',
+                        periodic_failure=proof, definition_failure=definitions,
+                        oneshots=('mail-pop-general-dispatch.service', 'mail-junk-digest-general.service',
                          'mail-client-cert-health.service', 'mail-management-log-viewer.service', 'mail-domain-routing-collect.service', 'mail-management-alerts-v1.service', 'mail-access-admin-v1.service', 'mail-feature-observer-v1.service', 'mail-protection-definitions-v1.service', 'mail-protection-publish-v1.service'))
         adapters = {}
         if config['channels']['email']:
