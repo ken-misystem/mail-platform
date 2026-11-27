@@ -15,7 +15,9 @@ RESIDUAL_SERVICE = 'mail-residual-pop-v1.service'
 CONTRACT = 'payload/blueprint/update-contract.json'
 NO_JOB = ('', '0')
 SYSTEMCTL = '/usr/bin/systemctl'
-FIELDS = 'Id,ActiveState,SubState,MainPID,Job,InvocationID,ActiveEnterTimestampMonotonic,ExecMainStatus'
+FIELDS = ('Id,ActiveState,SubState,MainPID,Job,InvocationID,ActiveEnterTimestampMonotonic,'
+          'Result,ExecMainCode,ExecMainStatus')
+RESIDUAL_HOLD_EVENT = {'status': 'held', 'reason': 'previous_cycle_not_verified'}
 
 
 def command(argv, timeout=25):
@@ -50,20 +52,29 @@ def self_worker():
 
 
 def residual_hold(row):
+    """Accept the collector's single hold record for this failed invocation."""
     invocation = row.get('InvocationID', '')
-    if not (row['ActiveState'] == 'failed' and row['SubState'] == 'failed' and row['ExecMainStatus'] == '1'
+    if not (row['Id'] == RESIDUAL_SERVICE and row['ActiveState'] == 'failed' and row['SubState'] == 'failed'
+            and row['MainPID'] == '0' and row['Job'] in NO_JOB
+            and row['Result'] == 'exit-code' and row['ExecMainCode'] == '1' and row['ExecMainStatus'] == '1'
             and re.fullmatch('[a-f0-9]{32}', invocation) and invocation.strip('0')):
         return False
-    raw = command(['/usr/bin/journalctl', '--no-pager', '-o', 'cat', '-n', '40',
+    raw = command(['/usr/bin/journalctl', '--quiet', '--no-pager', '-o', 'cat', '-n', '2',
                    '_SYSTEMD_UNIT='+RESIDUAL_SERVICE, '_SYSTEMD_INVOCATION_ID='+invocation])
-    for line in raw.splitlines():
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and event.get('reason') == 'previous_cycle_not_verified':
-            return True
-    return False
+    lines = raw.splitlines()
+    if len(lines) != 1:
+        return False
+    try:
+        return json.loads(lines[0]) == RESIDUAL_HOLD_EVENT
+    except ValueError:
+        return False
+
+
+def check_worker_failure(name, row):
+    if row['ActiveState'] != 'failed':
+        return False
+    require(name == RESIDUAL_SERVICE and residual_hold(row), 'scheduled_worker_failed:'+name)
+    return True
 
 
 def hooks_for_release(root, files, hook):
@@ -89,6 +100,10 @@ def hooks_for_release(root, files, hook):
         require(all(UPDATE_SERVICE not in selected[phase] for phase in ('stop', 'start', 'reload', 'health')),
                 'signed_contract_operates_on_current_update_worker')
 
+    # This factory runs under the update lock, before extraction and timer changes.
+    for name, row in properties(workers).items():
+        check_worker_failure(name, row)
+
     evidence = None
 
     def record(name, data):
@@ -100,9 +115,7 @@ def hooks_for_release(root, files, hook):
                     and row['ActiveState'] == 'activating' and row['SubState'] == 'start',
                     'current_update_worker_replaced')
             return True
-        if row.get('MainPID') != '0' or row.get('Job') not in NO_JOB:
-            return False
-        return stopped(row) or (name == RESIDUAL_SERVICE and residual_hold(row))
+        return check_worker_failure(name, row) or stopped(row)
 
     def verify_plan(transaction):
         code_plan = transaction/'code-update.json'
